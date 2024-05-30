@@ -9,13 +9,13 @@ impl PolynomialFeatures {
         PolynomialFeatures { degree }
     }
 
-    pub fn fit_transform(&self, X: &Array2<f64>) -> Array2<f64> {
-        let mut X_poly = X.clone();
+    pub fn fit_transform(&self, x: &Array2<f64>) -> Array2<f64> {
+        let mut x_poly = x.clone();
         for d in 2..=self.degree {
-            let X_d = X.mapv(|x| x.powi(d as i32));
-            X_poly = concatenate![Axis(1), X_poly, X_d];
+            let x_d = x.mapv(|x| x.powi(d as i32));
+            x_poly = concatenate![Axis(1), x_poly, x_d];
         }
-        X_poly
+        x_poly
     }
 }
 
@@ -65,14 +65,14 @@ mod tests {
 
     #[test]
     fn test_fit() {
-        let X = array![
+        let x = array![
             [1.0, 2.0, 3.0],
             [4.0, 5.0, 6.0],
             [7.0, 8.0, 9.0]
         ];
 
         let mut scaler = StandardScaler::new();
-        scaler.fit(&X);
+        scaler.fit(&x);
 
         assert!(scaler.mean.is_some());
         assert!(scaler.std_dev.is_some());
@@ -80,15 +80,15 @@ mod tests {
 
     #[test]
     fn test_transform() {
-        let X = array![
+        let x = array![
             [1.0, 2.0, 3.0],
             [4.0, 5.0, 6.0],
             [7.0, 8.0, 9.0]
         ];
 
         let mut scaler = StandardScaler::new();
-        scaler.fit(&X);
-        let X_scaled = scaler.transform(&X);
+        scaler.fit(&x);
+        let x_scaled = scaler.transform(&x);
 
         let expected_scaled = array![
             [-1.224744871391589, -1.224744871391589, -1.224744871391589],
@@ -96,7 +96,7 @@ mod tests {
             [1.224744871391589, 1.224744871391589, 1.224744871391589]
         ];
 
-        for (scaled_row, expected_row) in X_scaled.outer_iter().zip(expected_scaled.outer_iter()) {
+        for (scaled_row, expected_row) in x_scaled.outer_iter().zip(expected_scaled.outer_iter()) {
             for (scaled, expected) in scaled_row.iter().zip(expected_row.iter()) {
                 assert!((scaled - expected).abs() < 1e-6);
             }
@@ -105,14 +105,14 @@ mod tests {
 
     #[test]
     fn test_fit_transform() {
-        let X = array![
+        let x = array![
             [1.0, 2.0, 3.0],
             [4.0, 5.0, 6.0],
             [7.0, 8.0, 9.0]
         ];
 
         let mut scaler = StandardScaler::new();
-        let X_scaled = scaler.fit_transform(&X);
+        let x_scaled = scaler.fit_transform(&x);
 
         let expected_scaled = array![
             [-1.224744871391589, -1.224744871391589, -1.224744871391589],
@@ -120,7 +120,7 @@ mod tests {
             [1.224744871391589, 1.224744871391589, 1.224744871391589]
         ];
 
-        for (scaled_row, expected_row) in X_scaled.outer_iter().zip(expected_scaled.outer_iter()) {
+        for (scaled_row, expected_row) in x_scaled.outer_iter().zip(expected_scaled.outer_iter()) {
             for (scaled, expected) in scaled_row.iter().zip(expected_row.iter()) {
                 assert!((scaled - expected).abs() < 1e-6);
             }

@@ -75,6 +75,7 @@ dependencies = [
  "nalgebra",
  "ndarray",
  "ndarray-rand",
+ "ordered-float",
  "serde",
  "serde_derive",
  "serde_json",
@@ -196,6 +197,15 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
+]
+
+[[package]]
+name = "ordered-float"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a76df7075c7d4d01fdcb46c912dd17fba5b60c78ea480b475f2b6ab6f666584e"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
