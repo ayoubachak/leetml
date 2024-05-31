@@ -14,6 +14,7 @@ pub struct SimpleNN {
     hidden_size: usize,
     output_size: usize,
     learning_rate: f64,
+    dropout_rate: f64, // Add dropout rate
     weights_input_hidden: Array2<f64>,
     weights_hidden_output: Array2<f64>,
     bias_hidden: Array1<f64>,
@@ -21,7 +22,7 @@ pub struct SimpleNN {
 }
 
 impl SimpleNN {
-    pub fn new(input_size: usize, hidden_size: usize, output_size: usize, learning_rate: f64) -> Self {
+    pub fn new(input_size: usize, hidden_size: usize, output_size: usize, learning_rate: f64, dropout_rate: f64) -> Self {
         let weights_input_hidden = Array2::random((input_size, hidden_size), Uniform::new(-1.0, 1.0));
         let weights_hidden_output = Array2::random((hidden_size, output_size), Uniform::new(-1.0, 1.0));
         let bias_hidden = Array1::zeros(hidden_size);
@@ -32,11 +33,17 @@ impl SimpleNN {
             hidden_size,
             output_size,
             learning_rate,
+            dropout_rate, // Initialize dropout rate
             weights_input_hidden,
             weights_hidden_output,
             bias_hidden,
             bias_output,
         }
+    }
+
+    fn apply_dropout(&self, input: &Array1<f64>) -> Array1<f64> {
+        let mut rng = thread_rng();
+        input.mapv(|v| if rng.gen::<f64>() < self.dropout_rate { 0.0 } else { v })
     }
 
     fn sigmoid(x: &Array1<f64>) -> Array1<f64> {
@@ -47,12 +54,22 @@ impl SimpleNN {
         x * &(1.0 - x)
     }
 
-    pub fn forward(&self, input: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
+    fn softmax(x: &Array1<f64>) -> Array1<f64> {
+        let max = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let exps = x.mapv(|v| (v - max).exp());
+        let sum = exps.sum();
+        exps / sum
+    }
+
+    pub fn forward(&self, input: &Array1<f64>, training: bool) -> (Array1<f64>, Array1<f64>) {
         let hidden_input = input.dot(&self.weights_input_hidden) + &self.bias_hidden;
-        let hidden_output = Self::sigmoid(&hidden_input);
+        let mut hidden_output = Self::sigmoid(&hidden_input);
+        if training {
+            hidden_output = self.apply_dropout(&hidden_output);
+        }
         let final_input = hidden_output.dot(&self.weights_hidden_output) + &self.bias_output;
         let final_output = Self::sigmoid(&final_input);
-
+    
         (hidden_output, final_output)
     }
 
@@ -63,7 +80,7 @@ impl SimpleNN {
         final_output: &Array1<f64>,
         target: &Array1<f64>,
     ) {
-        let output_errors = target - final_output;
+        let output_errors = final_output - target;
         let output_delta = &output_errors * &Self::sigmoid_derivative(final_output);
 
         let hidden_errors = output_delta.dot(&self.weights_hidden_output.t());
@@ -82,14 +99,14 @@ impl SimpleNN {
             for (input, target) in inputs.outer_iter().zip(targets.outer_iter()) {
                 let input = input.to_owned();
                 let target = target.to_owned();
-                let (hidden_output, final_output) = self.forward(&input);
+                let (hidden_output, final_output) = self.forward(&input, true);
                 self.backward(&input, &hidden_output, &final_output, &target);
             }
         }
     }
-
+    
     pub fn predict(&self, input: &Array1<f64>) -> Array1<f64> {
-        let (_, final_output) = self.forward(input);
+        let (_, final_output) = self.forward(input, false);
         final_output
     }
 
@@ -202,22 +219,21 @@ impl MultiLayerNN {
             let activation_func = Self::get_activation_function(&self.activations[i]);
             let delta = &errors * &activation_func.derivative(activation);
             deltas.push(delta.clone());
-
             if i > 0 {
                 errors = delta.dot(&self.layers[i].weights().unwrap().t());
             }
         }
-
+            
         deltas.reverse();
         let mut previous_activation = input.clone();
-
+        
         for (i, delta) in deltas.iter().enumerate() {
             if let Layer::Dense { weights, biases } = &mut self.layers[i] {
                 let weight_update = previous_activation.view().insert_axis(Axis(1)).dot(&delta.view().insert_axis(Axis(0)));
                 *weights += &(weight_update * self.learning_rate);
                 *biases += &(delta * self.learning_rate);
             }
-
+        
             if i < activations.len() - 1 {
                 previous_activation = activations[i].clone();
             }
@@ -266,7 +282,6 @@ impl Layer {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::fs::remove_file;
@@ -284,9 +299,9 @@ mod tests {
 
     #[test]
     fn test_nn_forward() {
-        let nn = SimpleNN::new(2, 2, 1, 0.1);
+        let nn = SimpleNN::new(2, 2, 1, 0.1, 0.5);
         let input = array![0.5, 0.1];
-        let (_, output) = nn.forward(&input);
+        let (_, output) = nn.forward(&input, false); // Pass false for testing
 
         // Check if the output is in the expected range (0, 1)
         assert!(output.iter().all(|&x| x >= 0.0 && x <= 1.0));
@@ -294,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_nn_train() {
-        let mut nn = SimpleNN::new(2, 2, 1, 0.1);
+        let mut nn = SimpleNN::new(2, 2, 1, 0.1, 0.5);
         let inputs = array![[0.5, 0.1], [0.9, 0.8], [0.2, 0.4]];
         let targets = array![[0.6], [0.1], [0.4]];
         nn.train(&inputs, &targets, 1000);
@@ -308,7 +323,7 @@ mod tests {
 
     #[test]
     fn test_nn_save_load() {
-        let mut nn = SimpleNN::new(2, 2, 1, 0.1);
+        let mut nn = SimpleNN::new(2, 2, 1, 0.1, 0.5);
         let inputs = array![[0.5, 0.1], [0.9, 0.8], [0.2, 0.4]];
         let targets = array![[0.6], [0.1], [0.4]];
         nn.train(&inputs, &targets, 1000);
@@ -316,14 +331,53 @@ mod tests {
         nn.save("nn_model.json").expect("Failed to save model");
         let loaded_nn = SimpleNN::load("nn_model.json").expect("Failed to load model");
         remove_file("nn_model.json").expect("Failed to delete model file");
+
         let input = array![0.5, 0.1];
         let prediction = loaded_nn.predict(&input);
 
         // Check if the prediction is in the expected range (0, 1)
         assert!(prediction.iter().all(|&x| x >= 0.0 && x <= 1.0));
-
     }
 
+    #[test]
+    fn test_simple_nn_forward() {
+        let nn = SimpleNN::new(3, 5, 2, 0.1, 0.5);
+        let input = array![0.1, 0.2, 0.3];
+        let (_, output) = nn.forward(&input, false); // Pass false for testing
+        assert_eq!(output.len(), 2);
+    }
+
+    #[test]
+    fn test_simple_nn_train_predict() {
+        let mut nn = SimpleNN::new(3, 5, 2, 0.1, 0.5);
+        let inputs = array![[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]];
+        let targets = array![[0.0, 1.0], [1.0, 0.0]];
+
+        nn.train(&inputs, &targets, 1000);
+
+        let prediction = nn.predict(&array![0.1, 0.2, 0.3]);
+        assert_eq!(prediction.len(), 2);
+    }
+
+    #[test]
+    fn test_simple_nn_forward_with_dropout() {
+        let nn = SimpleNN::new(3, 5, 2, 0.1, 0.5);
+        let input = array![0.1, 0.2, 0.3];
+        let (_, output) = nn.forward(&input, true);
+        assert_eq!(output.len(), 2);
+    }
+
+    #[test]
+    fn test_simple_nn_train_predict_with_dropout() {
+        let mut nn = SimpleNN::new(3, 5, 2, 0.1, 0.5);
+        let inputs = array![[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]];
+        let targets = array![[0.0, 1.0], [1.0, 0.0]];
+
+        nn.train(&inputs, &targets, 1000);
+
+        let prediction = nn.predict(&array![0.1, 0.2, 0.3]);
+        assert_eq!(prediction.len(), 2);
+    }
     #[test]
     fn test_conv2d_forward() {
         let conv = Conv2D::new(1, 1, 2, 1, 0);
@@ -409,5 +463,65 @@ mod tests {
         let input = array![0.5, 0.3, 0.2];
         let output = nn.predict(&input);
         assert_eq!(output.shape(), &[2]);
+    }
+
+    #[test]
+    fn test_multi_layer_nn_forward() {
+        let nn = MultiLayerNN::new(
+            vec![3, 5, 2],
+            0.1,
+            vec!["relu".to_string(), "softmax".to_string()],
+            vec![0.0, 0.0],
+        );
+        let input = array![0.1, 0.2, 0.3];
+        let activations = nn.forward(&input, false);
+        assert_eq!(activations.last().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_multi_layer_nn_train_predict() {
+        let mut nn = MultiLayerNN::new(
+            vec![3, 5, 2],
+            0.1,
+            vec!["relu".to_string(), "softmax".to_string()],
+            vec![0.0, 0.0],
+        );
+        let inputs = array![[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]];
+        let targets = array![[0.0, 1.0], [1.0, 0.0]];
+
+        nn.train(&inputs, &targets, 1000);
+
+        let prediction = nn.predict(&array![0.1, 0.2, 0.3]);
+        assert_eq!(prediction.len(), 2);
+    }
+
+    #[test]
+    fn test_multi_layer_nn_forward_with_dropout() {
+        let nn = MultiLayerNN::new(
+            vec![3, 5, 2],
+            0.1,
+            vec!["relu".to_string(), "softmax".to_string()],
+            vec![0.5, 0.5],
+        );
+        let input = array![0.1, 0.2, 0.3];
+        let activations = nn.forward(&input, true);
+        assert_eq!(activations.last().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_multi_layer_nn_train_predict_with_dropout() {
+        let mut nn = MultiLayerNN::new(
+            vec![3, 5, 2],
+            0.1,
+            vec!["relu".to_string(), "softmax".to_string()],
+            vec![0.5, 0.5],
+        );
+        let inputs = array![[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]];
+        let targets = array![[0.0, 1.0], [1.0, 0.0]];
+
+        nn.train(&inputs, &targets, 1000);
+
+        let prediction = nn.predict(&array![0.1, 0.2, 0.3]);
+        assert_eq!(prediction.len(), 2);
     }
 }
