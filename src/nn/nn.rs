@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use super::activation::{ActivationFunction, LeakyReLU, ReLU, Sigmoid, Softmax, Tanh};
 use super::layers::{BatchNorm, Conv2D, MaxPool2D};
 
+// Additional modules for optimizers and schedulers
+
+
 #[derive(Serialize, Deserialize)]
 pub struct SimpleNN {
     input_size: usize,
@@ -15,6 +18,7 @@ pub struct SimpleNN {
     output_size: usize,
     learning_rate: f64,
     dropout_rate: f64, // Add dropout rate
+    l2_lambda: f64, // L2 regularization parameter
     weights_input_hidden: Array2<f64>,
     weights_hidden_output: Array2<f64>,
     bias_hidden: Array1<f64>,
@@ -22,7 +26,7 @@ pub struct SimpleNN {
 }
 
 impl SimpleNN {
-    pub fn new(input_size: usize, hidden_size: usize, output_size: usize, learning_rate: f64, dropout_rate: f64) -> Self {
+    pub fn new(input_size: usize, hidden_size: usize, output_size: usize, learning_rate: f64, dropout_rate: f64, l2_lambda: f64) -> Self {
         let weights_input_hidden = Array2::random((input_size, hidden_size), Uniform::new(-1.0, 1.0));
         let weights_hidden_output = Array2::random((hidden_size, output_size), Uniform::new(-1.0, 1.0));
         let bias_hidden = Array1::zeros(hidden_size);
@@ -34,6 +38,7 @@ impl SimpleNN {
             output_size,
             learning_rate,
             dropout_rate, // Initialize dropout rate
+            l2_lambda, // Initialize L2 regularization parameter
             weights_input_hidden,
             weights_hidden_output,
             bias_hidden,
@@ -43,7 +48,7 @@ impl SimpleNN {
 
     fn apply_dropout(&self, input: &Array1<f64>) -> Array1<f64> {
         let mut rng = thread_rng();
-        input.mapv(|v| if rng.gen::<f64>() < self.dropout_rate { 0.0 } else { v })
+        input.mapv(|v| if rng.gen::<f64>() < self.dropout_rate { 0.0 } else { v }) / (1.0 - self.dropout_rate)
     }
 
     fn sigmoid(x: &Array1<f64>) -> Array1<f64> {
@@ -86,11 +91,13 @@ impl SimpleNN {
         let hidden_errors = output_delta.dot(&self.weights_hidden_output.t());
         let hidden_delta = &hidden_errors * &Self::sigmoid_derivative(hidden_output);
 
-        // Update the weights and biases
-        self.weights_hidden_output = &self.weights_hidden_output + &hidden_output.view().insert_axis(Axis(1)).dot(&output_delta.view().insert_axis(Axis(0))) * self.learning_rate;
+        // Update the weights and biases with L2 regularization
+        self.weights_hidden_output = &self.weights_hidden_output * (1.0 - self.learning_rate * self.l2_lambda)
+            + &hidden_output.view().insert_axis(Axis(1)).dot(&output_delta.view().insert_axis(Axis(0))) * self.learning_rate;
         self.bias_output = &self.bias_output + &output_delta * self.learning_rate;
 
-        self.weights_input_hidden = &self.weights_input_hidden + &input.view().insert_axis(Axis(1)).dot(&hidden_delta.view().insert_axis(Axis(0))) * self.learning_rate;
+        self.weights_input_hidden = &self.weights_input_hidden * (1.0 - self.learning_rate * self.l2_lambda)
+            + &input.view().insert_axis(Axis(1)).dot(&hidden_delta.view().insert_axis(Axis(0))) * self.learning_rate;
         self.bias_hidden = &self.bias_hidden + &hidden_delta * self.learning_rate;
     }
 
@@ -125,13 +132,18 @@ impl SimpleNN {
 
 
 #[derive(Serialize, Deserialize)]
+pub struct DenseLayer {
+    weights: Array2<f64>,
+    biases: Array1<f64>,
+}
+
+#[derive(Serialize, Deserialize)]
 pub enum Layer {
-    Dense { weights: Array2<f64>, biases: Array1<f64> },
+    Dense(DenseLayer),
     Conv2D(Conv2D),
     MaxPool2D(MaxPool2D),
     BatchNorm(BatchNorm),
 }
-
 
 #[derive(Serialize, Deserialize)]
 pub struct MultiLayerNN {
@@ -140,10 +152,12 @@ pub struct MultiLayerNN {
     layers: Vec<Layer>,
     activations: Vec<String>,
     dropout_rates: Vec<f64>,
+    l2_lambda: f64, // L2 regularization parameter
+    optimizer: String, // Placeholder for optimizer type
 }
 
 impl MultiLayerNN {
-    pub fn new(layer_sizes: Vec<usize>, learning_rate: f64, activations: Vec<String>, dropout_rates: Vec<f64>) -> Self {
+    pub fn new(layer_sizes: Vec<usize>, learning_rate: f64, activations: Vec<String>, dropout_rates: Vec<f64>, l2_lambda: f64, optimizer: String) -> Self {
         assert_eq!(layer_sizes.len() - 1, activations.len());
         assert_eq!(layer_sizes.len() - 1, dropout_rates.len());
 
@@ -152,7 +166,8 @@ impl MultiLayerNN {
         for i in 0..layer_sizes.len() - 1 {
             let weights = Array2::random((layer_sizes[i], layer_sizes[i + 1]), Uniform::new(-1.0, 1.0));
             let biases = Array1::zeros(layer_sizes[i + 1]);
-            layers.push(Layer::Dense { weights, biases });
+            layers.push(Layer::Dense(DenseLayer { weights, biases }));
+
         }
 
         MultiLayerNN {
@@ -161,6 +176,8 @@ impl MultiLayerNN {
             layers,
             activations,
             dropout_rates,
+            l2_lambda,
+            optimizer,
         }
     }
 
@@ -187,7 +204,7 @@ impl MultiLayerNN {
         for (i, (layer, act_name)) in izip!(&self.layers, &self.activations).enumerate() {
             let activation_func = Self::get_activation_function(act_name);
             let mut z = match layer {
-                Layer::Dense { weights, biases } => current_input.dot(weights) + biases,
+                Layer::Dense(DenseLayer { weights, biases }) => current_input.dot(weights) + biases,
                 _ => unimplemented!(),
             };
             let mut activation = activation_func.activate(&z);
@@ -228,7 +245,7 @@ impl MultiLayerNN {
         let mut previous_activation = input.clone();
         
         for (i, delta) in deltas.iter().enumerate() {
-            if let Layer::Dense { weights, biases } = &mut self.layers[i] {
+            if let Layer::Dense(DenseLayer { weights, biases }) = &mut self.layers[i] {
                 let weight_update = previous_activation.view().insert_axis(Axis(1)).dot(&delta.view().insert_axis(Axis(0)));
                 *weights += &(weight_update * self.learning_rate);
                 *biases += &(delta * self.learning_rate);
@@ -265,22 +282,28 @@ impl MultiLayerNN {
     }
 
     // Load the model from a file
-    pub fn load(path: &str) -> std::io::Result<Self> {
+    pub fn load(path: &str) -> Result<Self, std::io::Error> {
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
-        let model = serde_json::from_reader(reader)?;
-        Ok(model)
+        let model: Result<Self, _> = serde_json::from_reader(reader);
+        model.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }
 
 impl Layer {
     pub fn weights(&self) -> Option<&Array2<f64>> {
         match self {
-            Layer::Dense { weights, .. } => Some(weights),
+            Layer::Dense(DenseLayer { weights, .. }) => Some(weights),
             _ => None,
         }
     }
 }
+
+// Sample optimizers module (optimizers.rs)
+
+
+// Sample learning rate scheduler module (schedulers.rs)
+
 
 #[cfg(test)]
 mod tests {
@@ -299,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_nn_forward() {
-        let nn = SimpleNN::new(2, 2, 1, 0.1, 0.5);
+        let nn = SimpleNN::new(2, 2, 1, 0.1, 0.5, 0.01);
         let input = array![0.5, 0.1];
         let (_, output) = nn.forward(&input, false); // Pass false for testing
 
@@ -309,7 +332,7 @@ mod tests {
 
     #[test]
     fn test_nn_train() {
-        let mut nn = SimpleNN::new(2, 2, 1, 0.1, 0.5);
+        let mut nn = SimpleNN::new(2, 2, 1, 0.1, 0.5, 0.01);
         let inputs = array![[0.5, 0.1], [0.9, 0.8], [0.2, 0.4]];
         let targets = array![[0.6], [0.1], [0.4]];
         nn.train(&inputs, &targets, 1000);
@@ -323,7 +346,7 @@ mod tests {
 
     #[test]
     fn test_nn_save_load() {
-        let mut nn = SimpleNN::new(2, 2, 1, 0.1, 0.5);
+        let mut nn = SimpleNN::new(2, 2, 1, 0.1, 0.5, 0.01);
         let inputs = array![[0.5, 0.1], [0.9, 0.8], [0.2, 0.4]];
         let targets = array![[0.6], [0.1], [0.4]];
         nn.train(&inputs, &targets, 1000);
@@ -341,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_simple_nn_forward() {
-        let nn = SimpleNN::new(3, 5, 2, 0.1, 0.5);
+        let nn = SimpleNN::new(3, 5, 2, 0.1, 0.5, 0.01);
         let input = array![0.1, 0.2, 0.3];
         let (_, output) = nn.forward(&input, false); // Pass false for testing
         assert_eq!(output.len(), 2);
@@ -349,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_simple_nn_train_predict() {
-        let mut nn = SimpleNN::new(3, 5, 2, 0.1, 0.5);
+        let mut nn = SimpleNN::new(3, 5, 2, 0.1, 0.5, 0.01);
         let inputs = array![[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]];
         let targets = array![[0.0, 1.0], [1.0, 0.0]];
 
@@ -361,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_simple_nn_forward_with_dropout() {
-        let nn = SimpleNN::new(3, 5, 2, 0.1, 0.5);
+        let nn = SimpleNN::new(3, 5, 2, 0.1, 0.5, 0.01);
         let input = array![0.1, 0.2, 0.3];
         let (_, output) = nn.forward(&input, true);
         assert_eq!(output.len(), 2);
@@ -369,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_simple_nn_train_predict_with_dropout() {
-        let mut nn = SimpleNN::new(3, 5, 2, 0.1, 0.5);
+        let mut nn = SimpleNN::new(3, 5, 2, 0.1, 0.5, 0.01);
         let inputs = array![[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]];
         let targets = array![[0.0, 1.0], [1.0, 0.0]];
 
@@ -378,6 +401,7 @@ mod tests {
         let prediction = nn.predict(&array![0.1, 0.2, 0.3]);
         assert_eq!(prediction.len(), 2);
     }
+
     #[test]
     fn test_conv2d_forward() {
         let conv = Conv2D::new(1, 1, 2, 1, 0);
@@ -428,7 +452,9 @@ mod tests {
         let learning_rate = 0.01;
         let activations = vec!["relu".to_string(), "sigmoid".to_string()];
         let dropout_rates = vec![0.2, 0.2];
-        let mut nn = MultiLayerNN::new(layer_sizes, learning_rate, activations, dropout_rates);
+        let l2_lambda = 0.01;
+        let optimizer = "sgd".to_string(); // Placeholder for optimizer
+        let mut nn = MultiLayerNN::new(layer_sizes, learning_rate, activations, dropout_rates, l2_lambda, optimizer);
 
         let inputs = array![[0.5, 0.3, 0.2], [0.6, 0.4, 0.1]];
         let targets = array![[1.0, 0.0], [0.0, 1.0]];
@@ -454,7 +480,9 @@ mod tests {
         let learning_rate = 0.01;
         let activations = vec!["relu".to_string(), "softmax".to_string()];
         let dropout_rates = vec![0.2, 0.2];
-        let mut nn = MultiLayerNN::new(layer_sizes, learning_rate, activations, dropout_rates);
+        let l2_lambda = 0.01;
+        let optimizer = "sgd".to_string(); // Placeholder for optimizer
+        let mut nn = MultiLayerNN::new(layer_sizes, learning_rate, activations, dropout_rates, l2_lambda, optimizer);
 
         let inputs = array![[0.5, 0.3, 0.2], [0.6, 0.4, 0.1]];
         let targets = array![[1.0, 0.0], [0.0, 1.0]];
@@ -472,6 +500,8 @@ mod tests {
             0.1,
             vec!["relu".to_string(), "softmax".to_string()],
             vec![0.0, 0.0],
+            0.01,
+            "sgd".to_string(),
         );
         let input = array![0.1, 0.2, 0.3];
         let activations = nn.forward(&input, false);
@@ -485,6 +515,8 @@ mod tests {
             0.1,
             vec!["relu".to_string(), "softmax".to_string()],
             vec![0.0, 0.0],
+            0.01,
+            "sgd".to_string(),
         );
         let inputs = array![[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]];
         let targets = array![[0.0, 1.0], [1.0, 0.0]];
@@ -502,6 +534,8 @@ mod tests {
             0.1,
             vec!["relu".to_string(), "softmax".to_string()],
             vec![0.5, 0.5],
+            0.01,
+            "sgd".to_string(),
         );
         let input = array![0.1, 0.2, 0.3];
         let activations = nn.forward(&input, true);
@@ -515,6 +549,8 @@ mod tests {
             0.1,
             vec!["relu".to_string(), "softmax".to_string()],
             vec![0.5, 0.5],
+            0.01,
+            "sgd".to_string(),
         );
         let inputs = array![[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]];
         let targets = array![[0.0, 1.0], [1.0, 0.0]];
