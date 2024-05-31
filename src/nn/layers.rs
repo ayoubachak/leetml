@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 pub struct Conv2D {
-    filters: Array4<f64>,
-    biases: Array1<f64>,
-    stride: usize,
-    padding: usize,
+    pub filters: Array4<f64>,
+    pub biases: Array1<f64>,
+    pub stride: usize,
+    pub padding: usize,
 }
 
 impl Conv2D {
@@ -113,3 +113,12 @@ impl BatchNorm {
 }
 
 
+impl BatchNorm {
+    pub fn forward_3d(&mut self, input: &Array3<f64>, training: bool) -> Array3<f64> {
+        let (c, h, w) = input.dim();
+        let input_reshaped = input.view().into_shape((c, h * w)).unwrap().to_owned(); // Convert the view reference to an owned array reference
+        let output_reshaped = self.forward(&input_reshaped, training);
+        output_reshaped.into_shape((c, h, w)).unwrap()
+    }
+
+}

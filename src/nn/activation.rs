@@ -1,9 +1,16 @@
-use ndarray::Array1;
+use ndarray::{array, Array1, Array3};
 use serde::{Deserialize, Serialize};
 
 pub trait ActivationFunction {
     fn activate(&self, input: &Array1<f64>) -> Array1<f64>;
     fn derivative(&self, input: &Array1<f64>) -> Array1<f64>;
+    fn activate_3d(&self, input: &Array3<f64>) -> Array3<f64> {
+        input.mapv(|v| self.activate(&array![v])[0])
+    }
+
+    fn derivative_3d(&self, input: &Array3<f64>) -> Array3<f64> {
+        input.mapv(|v| self.derivative(&array![v])[0])
+    }
 }
 
 pub struct Sigmoid;
