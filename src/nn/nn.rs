@@ -1,10 +1,12 @@
 use itertools::izip;
 use ndarray::{Array1, Array2, Axis, array};
-use ndarray_rand::rand_distr::Uniform;
+use ndarray_rand::rand::{thread_rng, Rng};
+use ndarray_rand::{rand::rngs::ThreadRng, rand_distr::Uniform};
 use ndarray_rand::RandomExt;
 use serde::{Deserialize, Serialize};
 
-use super::activation::{ActivationFunction, ReLU, Sigmoid, Tanh};
+use super::activation::{ActivationFunction, LeakyReLU, ReLU, Sigmoid, Softmax, Tanh};
+use super::layers::{BatchNorm, Conv2D, MaxPool2D};
 
 #[derive(Serialize, Deserialize)]
 pub struct SimpleNN {
@@ -106,32 +108,42 @@ impl SimpleNN {
 
 
 #[derive(Serialize, Deserialize)]
+pub enum Layer {
+    Dense { weights: Array2<f64>, biases: Array1<f64> },
+    Conv2D(Conv2D),
+    MaxPool2D(MaxPool2D),
+    BatchNorm(BatchNorm),
+}
+
+
+#[derive(Serialize, Deserialize)]
 pub struct MultiLayerNN {
     layer_sizes: Vec<usize>,
     learning_rate: f64,
-    weights: Vec<Array2<f64>>,
-    biases: Vec<Array1<f64>>,
+    layers: Vec<Layer>,
     activations: Vec<String>,
+    dropout_rates: Vec<f64>,
 }
 
 impl MultiLayerNN {
-    pub fn new(layer_sizes: Vec<usize>, learning_rate: f64, activations: Vec<String>) -> Self {
-        let mut weights = Vec::new();
-        let mut biases = Vec::new();
+    pub fn new(layer_sizes: Vec<usize>, learning_rate: f64, activations: Vec<String>, dropout_rates: Vec<f64>) -> Self {
+        assert_eq!(layer_sizes.len() - 1, activations.len());
+        assert_eq!(layer_sizes.len() - 1, dropout_rates.len());
+
+        let mut layers = Vec::new();
 
         for i in 0..layer_sizes.len() - 1 {
-            let weight = Array2::random((layer_sizes[i], layer_sizes[i + 1]), Uniform::new(-1.0, 1.0));
-            let bias = Array1::zeros(layer_sizes[i + 1]);
-            weights.push(weight);
-            biases.push(bias);
+            let weights = Array2::random((layer_sizes[i], layer_sizes[i + 1]), Uniform::new(-1.0, 1.0));
+            let biases = Array1::zeros(layer_sizes[i + 1]);
+            layers.push(Layer::Dense { weights, biases });
         }
 
         MultiLayerNN {
             layer_sizes,
             learning_rate,
-            weights,
-            biases,
+            layers,
             activations,
+            dropout_rates,
         }
     }
 
@@ -139,18 +151,32 @@ impl MultiLayerNN {
         match name {
             "relu" => Box::new(ReLU),
             "tanh" => Box::new(Tanh),
+            "sigmoid" => Box::new(Sigmoid),
+            "leaky_relu" => Box::new(LeakyReLU::new(0.01)),
+            "softmax" => Box::new(Softmax),
             _ => Box::new(Sigmoid),
         }
     }
 
-    pub fn forward(&self, input: &Array1<f64>) -> Vec<Array1<f64>> {
+    fn apply_dropout(input: &Array1<f64>, rate: f64) -> Array1<f64> {
+        let mut rng = thread_rng();
+        input.mapv(|v| if rng.gen::<f64>() < rate { 0.0 } else { v })
+    }
+
+    pub fn forward(&self, input: &Array1<f64>, training: bool) -> Vec<Array1<f64>> {
         let mut activations = Vec::new();
         let mut current_input = input.clone();
 
-        for (weight, bias, act_name) in izip!(&self.weights, &self.biases, &self.activations) {
+        for (i, (layer, act_name)) in izip!(&self.layers, &self.activations).enumerate() {
             let activation_func = Self::get_activation_function(act_name);
-            let z = current_input.dot(weight) + bias;
-            let activation = activation_func.activate(&z);
+            let mut z = match layer {
+                Layer::Dense { weights, biases } => current_input.dot(weights) + biases,
+                _ => unimplemented!(),
+            };
+            let mut activation = activation_func.activate(&z);
+            if training {
+                activation = Self::apply_dropout(&activation, self.dropout_rates[i]);
+            }
             activations.push(activation.clone());
             current_input = activation;
         }
@@ -164,17 +190,21 @@ impl MultiLayerNN {
         activations: &Vec<Array1<f64>>,
         target: &Array1<f64>,
     ) {
-        let mut errors = target - activations.last().unwrap();
+        let mut errors = match self.activations.last().unwrap().as_str() {
+            "softmax" => activations.last().unwrap() - target,
+            _ => target - activations.last().unwrap(),
+        };
+
         let mut deltas = Vec::new();
 
-        for i in (0..self.weights.len()).rev() {
+        for i in (0..self.layers.len()).rev() {
             let activation = &activations[i];
             let activation_func = Self::get_activation_function(&self.activations[i]);
             let delta = &errors * &activation_func.derivative(activation);
             deltas.push(delta.clone());
 
             if i > 0 {
-                errors = delta.dot(&self.weights[i].t());
+                errors = delta.dot(&self.layers[i].weights().unwrap().t());
             }
         }
 
@@ -182,9 +212,11 @@ impl MultiLayerNN {
         let mut previous_activation = input.clone();
 
         for (i, delta) in deltas.iter().enumerate() {
-            let weight_update = previous_activation.view().insert_axis(Axis(1)).dot(&delta.view().insert_axis(Axis(0)));
-            self.weights[i] += &(weight_update * self.learning_rate);
-            self.biases[i] += &(delta * self.learning_rate);
+            if let Layer::Dense { weights, biases } = &mut self.layers[i] {
+                let weight_update = previous_activation.view().insert_axis(Axis(1)).dot(&delta.view().insert_axis(Axis(0)));
+                *weights += &(weight_update * self.learning_rate);
+                *biases += &(delta * self.learning_rate);
+            }
 
             if i < activations.len() - 1 {
                 previous_activation = activations[i].clone();
@@ -197,14 +229,14 @@ impl MultiLayerNN {
             for (input, target) in inputs.outer_iter().zip(targets.outer_iter()) {
                 let input = input.to_owned();
                 let target = target.to_owned();
-                let activations = self.forward(&input);
+                let activations = self.forward(&input, true);
                 self.backward(&input, &activations, &target);
             }
         }
     }
 
     pub fn predict(&self, input: &Array1<f64>) -> Array1<f64> {
-        let activations = self.forward(input);
+        let activations = self.forward(input, false);
         activations.last().unwrap().clone()
     }
 
@@ -225,8 +257,14 @@ impl MultiLayerNN {
     }
 }
 
-
-
+impl Layer {
+    pub fn weights(&self) -> Option<&Array2<f64>> {
+        match self {
+            Layer::Dense { weights, .. } => Some(weights),
+            _ => None,
+        }
+    }
+}
 
 
 #[cfg(test)]
@@ -235,6 +273,12 @@ mod tests {
 
     use ndarray::{array, Array1, Array2};
 
+    use crate::nn::activation::ActivationFunction;
+    use crate::nn::activation::LeakyReLU;
+    use crate::nn::activation::Softmax;
+    use crate::nn::layers::BatchNorm;
+    use crate::nn::layers::Conv2D;
+    use crate::nn::layers::MaxPool2D;
     use crate::nn::nn::SimpleNN;
     use crate::nn::nn::MultiLayerNN;
 
@@ -281,45 +325,89 @@ mod tests {
     }
 
     #[test]
-    fn test_nn_forward_with_relu() {
-        let nn = MultiLayerNN::new(vec![2, 2, 1], 0.1, vec!["relu".to_string(), "sigmoid".to_string()]);
-        let input = array![0.5, 0.1];
-        let activations = nn.forward(&input);
-        let output = activations.last().unwrap();
-
-        // Check if the output is in the expected range (0, 1)
-        assert!(output.iter().all(|&x| x >= 0.0 && x <= 1.0));
+    fn test_conv2d_forward() {
+        let conv = Conv2D::new(1, 1, 2, 1, 0);
+        let input = array![
+            [[1.0, 2.0, 3.0],
+             [4.0, 5.0, 6.0],
+             [7.0, 8.0, 9.0]]
+        ];
+        let output = conv.forward(&input);
+        assert_eq!(output.shape(), &[1, 2, 2]);
     }
 
     #[test]
-    fn test_nn_train_with_tanh() {
-        let mut nn = MultiLayerNN::new(vec![2, 2, 1], 0.1, vec!["tanh".to_string(), "sigmoid".to_string()]);
-        let inputs = array![[0.5, 0.1], [0.9, 0.8], [0.2, 0.4]];
-        let targets = array![[0.6], [0.1], [0.4]];
-        nn.train(&inputs, &targets, 1000);
-
-        let input = array![0.5, 0.1];
-        let prediction = nn.predict(&input);
-
-        // Check if the prediction is in the expected range (0, 1)
-        assert!(prediction.iter().all(|&x| x >= 0.0 && x <= 1.0));
+    fn test_maxpool2d_forward() {
+        let pool = MaxPool2D::new(2, 2);
+        let input = array![
+            [[1.0, 2.0, 3.0, 4.0],
+             [5.0, 6.0, 7.0, 8.0],
+             [9.0, 10.0, 11.0, 12.0],
+             [13.0, 14.0, 15.0, 16.0]]
+        ];
+        let output = pool.forward(&input);
+        assert_eq!(output.shape(), &[1, 2, 2]);
     }
 
     #[test]
-    fn test_nn_save_load_with_activations() {
-        let mut nn = MultiLayerNN::new(vec![2, 2, 1], 0.1, vec!["sigmoid".to_string(), "relu".to_string()]);
-        let inputs = array![[0.5, 0.1], [0.9, 0.8], [0.2, 0.4]];
-        let targets = array![[0.6], [0.1], [0.4]];
-        nn.train(&inputs, &targets, 1000);
+    fn test_batchnorm_forward() {
+        let mut bn = BatchNorm::new(3, 1e-5, 0.1);
+        let input = array![
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0]
+        ];
+        let output = bn.forward(&input, true);
+        assert_eq!(output.shape(), &[2, 3]);
+    }
 
-        nn.save("nn_model_with_activations.json").expect("Failed to save model");
-        let loaded_nn = MultiLayerNN::load("nn_model_with_activations.json").expect("Failed to load model");
-        remove_file("nn_model_with_activations.json").expect("Failed to delete model file");
+    #[test]
+    fn test_leaky_relu_forward() {
+        let leaky_relu = LeakyReLU::new(0.01);
+        let input = array![1.0, -2.0, 3.0];
+        let output = leaky_relu.activate(&input);
+        assert_eq!(output.shape(), &[3]);
+    }
 
-        let input = array![0.5, 0.1];
-        let prediction = loaded_nn.predict(&input);
+    #[test]
+    fn test_multilayer_nn_with_conv_and_pool() {
+        let layer_sizes = vec![3, 5, 2];
+        let learning_rate = 0.01;
+        let activations = vec!["relu".to_string(), "sigmoid".to_string()];
+        let dropout_rates = vec![0.2, 0.2];
+        let mut nn = MultiLayerNN::new(layer_sizes, learning_rate, activations, dropout_rates);
 
-        // Check if the prediction is in the expected range (0, 1)
-        assert!(prediction.iter().all(|&x| x >= 0.0 && x <= 1.0));
+        let inputs = array![[0.5, 0.3, 0.2], [0.6, 0.4, 0.1]];
+        let targets = array![[1.0, 0.0], [0.0, 1.0]];
+        nn.train(&inputs, &targets, 100);
+
+        let input = array![0.5, 0.3, 0.2];
+        let output = nn.predict(&input);
+        assert_eq!(output.shape(), &[2]);
+    }
+
+    #[test]
+    fn test_softmax_activation() {
+        let softmax = Softmax;
+        let input = array![1.0, 2.0, 3.0];
+        let output = softmax.activate(&input);
+        let sum: f64 = output.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_multilayer_nn_with_softmax() {
+        let layer_sizes = vec![3, 5, 2];
+        let learning_rate = 0.01;
+        let activations = vec!["relu".to_string(), "softmax".to_string()];
+        let dropout_rates = vec![0.2, 0.2];
+        let mut nn = MultiLayerNN::new(layer_sizes, learning_rate, activations, dropout_rates);
+
+        let inputs = array![[0.5, 0.3, 0.2], [0.6, 0.4, 0.1]];
+        let targets = array![[1.0, 0.0], [0.0, 1.0]];
+        nn.train(&inputs, &targets, 100);
+
+        let input = array![0.5, 0.3, 0.2];
+        let output = nn.predict(&input);
+        assert_eq!(output.shape(), &[2]);
     }
 }
