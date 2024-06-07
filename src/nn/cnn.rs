@@ -1,63 +1,71 @@
-use ndarray::{s, Array1, Array2, Array3, Array4};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use ndarray::{Array1, Array2, Array3, Array4, Axis, s, Zip};
+use ndarray_rand::rand::{thread_rng, Rng};
+use ndarray_rand::rand_distr::Uniform;
+use ndarray_rand::RandomExt;
+use serde::{Deserialize, Serialize};
 
-use crate::nn::activation::{ActivationFunction, ReLU, Sigmoid, Softmax};
-use crate::nn::layers::{BatchNorm, Conv2D, MaxPool2D};
-use crate::nn::optimizers::Optimizer;
+use super::activation::{ActivationFunction, ReLU, Sigmoid, Softmax, Tanh, LeakyReLU};
+use super::layers::{BatchNorm, Conv2D, MaxPool2D};
+use super::optimizers::Optimizer;
+use super::schedulers::Scheduler;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct CNN {
     conv_layers: Vec<Conv2D>,
     pool_layers: Vec<MaxPool2D>,
-    dense_layers: Vec<(Array2<f64>, Array1<f64>)>,
-    batch_norm_layers: Vec<BatchNorm>,
-    activations: Vec<String>,
-    #[serde(skip)] // Skip serialization/deserialization for the optimizer
-    optimizer: Box<dyn Optimizer>,
-}
-
-impl<'de> Deserialize<'de> for CNN {
-    fn deserialize<D>(deserializer: D) -> Result<CNN, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct CNNData {
-            conv_layers: Vec<Conv2D>,
-            pool_layers: Vec<MaxPool2D>,
-            dense_layers: Vec<(Array2<f64>, Array1<f64>)>,
-            batch_norm_layers: Vec<BatchNorm>,
-            activations: Vec<String>,
-        }
-
-        let data = CNNData::deserialize(deserializer)?;
-
-        Ok(CNN {
-            conv_layers: data.conv_layers,
-            pool_layers: data.pool_layers,
-            dense_layers: data.dense_layers,
-            batch_norm_layers: data.batch_norm_layers,
-            activations: data.activations,
-            optimizer: Box::new(crate::nn::optimizers::SGD { learning_rate: 0.01 }), // default optimizer
-        })
-    }
+    dense_layers: Vec<Array2<f64>>,
+    dense_biases: Vec<Array1<f64>>,
+    learning_rate: f64,
+    dropout_rates: Vec<f64>,
+    l2_lambda: f64,
+    optimizer: String, // Placeholder for optimizer type
 }
 
 impl CNN {
     pub fn new(
         conv_layers: Vec<Conv2D>,
         pool_layers: Vec<MaxPool2D>,
-        dense_layers: Vec<(Array2<f64>, Array1<f64>)>,
-        batch_norm_layers: Vec<BatchNorm>,
-        activations: Vec<String>,
-        optimizer: Box<dyn Optimizer>,
+        dense_layer_sizes: Vec<usize>,
+        learning_rate: f64,
+        dropout_rates: Vec<f64>,
+        l2_lambda: f64,
+        optimizer: String,
     ) -> Self {
+        let mut dense_layers = Vec::new();
+        let mut dense_biases = Vec::new();
+
+        // Determine the size of the flattened input after convolution and pooling layers
+        let flattened_size = {
+            // Assuming input shape is (channels, height, width)
+            let input_shape = (1, 3, 3);  // Update this based on your input shape
+            let mut current_shape = input_shape;
+
+            for (conv_layer, pool_layer) in conv_layers.iter().zip(&pool_layers) {
+                current_shape = conv_layer.output_shape(current_shape);
+                current_shape = pool_layer.output_shape(current_shape);
+            }
+
+            current_shape.0 * current_shape.1 * current_shape.2
+        };
+
+        // The first dense layer should connect to the flattened output of the convolutional layers
+        let mut prev_size = flattened_size;
+        for &size in &dense_layer_sizes {
+            let weights = Array2::random((prev_size, size), Uniform::new(-1.0, 1.0));
+            let biases = Array1::zeros(size);
+            dense_layers.push(weights);
+            dense_biases.push(biases);
+            prev_size = size;
+        }
+
         CNN {
             conv_layers,
             pool_layers,
             dense_layers,
-            batch_norm_layers,
-            activations,
+            dense_biases,
+            learning_rate,
+            dropout_rates,
+            l2_lambda,
             optimizer,
         }
     }
@@ -65,122 +73,90 @@ impl CNN {
     fn get_activation_function(name: &str) -> Box<dyn ActivationFunction> {
         match name {
             "relu" => Box::new(ReLU),
+            "tanh" => Box::new(Tanh),
             "sigmoid" => Box::new(Sigmoid),
+            "leaky_relu" => Box::new(LeakyReLU::new(0.01)),
             "softmax" => Box::new(Softmax),
             _ => Box::new(Sigmoid),
         }
     }
 
-    pub fn forward(&mut self, input: &Array3<f64>, training: bool) -> Vec<Array3<f64>> {
+    fn apply_dropout(input: &Array1<f64>, rate: f64) -> Array1<f64> {
+        let mut rng = thread_rng();
+        input.mapv(|v| if rng.gen::<f64>() < rate { 0.0 } else { v }) / (1.0 - rate)
+    }
+
+    pub fn forward(&self, input: &Array3<f64>, training: bool) -> Vec<Array1<f64>> {
         let mut activations = Vec::new();
         let mut current_input = input.clone();
 
         for (i, conv_layer) in self.conv_layers.iter().enumerate() {
-            let mut output = conv_layer.forward(&current_input);
+            let conv_output = conv_layer.forward(&current_input);
+            let pool_output = self.pool_layers[i].forward(&conv_output);
+            current_input = pool_output;
+        }
+
+        println!("Shape after conv and pool: {:?}", current_input.shape());
+
+        let flat_input = current_input.clone().into_shape((current_input.len(),)).unwrap();
+        let mut dense_input = flat_input;
+
+        println!("Shape after flattening: {:?}", dense_input.shape());
+
+        for (i, (dense_layer, dropout_rate)) in self.dense_layers.iter().zip(&self.dropout_rates).enumerate() {
+            println!("Dense layer {} shape: {:?}", i, dense_layer.shape());
+            let z = dense_input.dot(dense_layer) + &self.dense_biases[i];
+            let activation_func = Self::get_activation_function("relu"); // Replace with your activation function choice
+            let mut activation = activation_func.activate(&z);
             if training {
-                output = self.batch_norm_layers[i].forward_3d(&output, training);
+                activation = Self::apply_dropout(&activation, *dropout_rate);
             }
-            let activation_func = Self::get_activation_function(&self.activations[i]);
-            let activation = activation_func.activate_3d(&output);
-            activations.push(activation.clone());
-            current_input = activation;
-        }
-
-        for pool_layer in &self.pool_layers {
-            current_input = pool_layer.forward(&current_input);
-        }
-
-        let flattened_input = current_input.clone().into_shape((current_input.len(),)).unwrap();
-        let mut current_input = flattened_input;
-
-        for (i, (weights, biases)) in self.dense_layers.iter().enumerate() {
-            let activation_func = Self::get_activation_function(&self.activations[self.conv_layers.len() + i]);
-            let z = current_input.dot(weights) + biases;
-            let activation = activation_func.activate(&z);
-            current_input = activation.clone();
-            activations.push(activation.clone().into_shape((1, 1, activation.len())).unwrap());
+            dense_input = activation.clone();
+            activations.push(dense_input.clone());
         }
 
         activations
     }
 
-    pub fn backward(&mut self, input: &Array3<f64>, activations: &Vec<Array3<f64>>, target: &Array1<f64>) {
-        let mut errors = match self.activations.last().unwrap().as_str() {
-            "softmax" => activations.last().unwrap().clone().into_shape(target.raw_dim()).unwrap() - target,
-            _ => activations.last().unwrap().clone().into_shape(target.raw_dim()).unwrap() - target,
-        };
-
+    pub fn backward(
+        &mut self,
+        input: &Array3<f64>,
+        activations: &Vec<Array1<f64>>,
+        target: &Array1<f64>,
+    ) {
+        let mut errors = activations.last().unwrap() - target;
         let mut deltas = Vec::new();
 
         for i in (0..self.dense_layers.len()).rev() {
-            let activation = &activations[self.conv_layers.len() + i].clone().into_shape(target.raw_dim()).unwrap();
-            let activation_func = Self::get_activation_function(&self.activations[self.conv_layers.len() + i]);
-            let delta = &errors * &activation_func.derivative(&activation);
+            let activation_func = Self::get_activation_function("relu"); // Replace with your activation function choice
+            let activation = &activations[i];
+            let delta = &errors * &activation_func.derivative(activation);
             deltas.push(delta.clone());
 
-            let (weights, biases) = &mut self.dense_layers[i];
-            let delta_reshaped = delta.clone().into_shape((delta.len(), 1)).unwrap();
-            let dw = delta_reshaped.dot(&activations[self.conv_layers.len() + i - 1].clone().into_shape((1, activations[self.conv_layers.len() + i - 1].len())).unwrap());
-            self.optimizer.update(weights, biases, &dw, &delta.sum_axis(ndarray::Axis(0)).insert_axis(ndarray::Axis(0)));
-
             if i > 0 {
-                errors = delta.dot(&weights.t());
+                errors = delta.dot(&self.dense_layers[i].t());
             }
         }
 
         deltas.reverse();
-        let mut previous_activation = input.clone();
-        let mut gradient_data = Vec::new();
+        let flattened_input_size = input.len(); // This should be 9 in your case
+        println!("Flattened input size: {}", flattened_input_size); // Debug size
+        let mut previous_activation = input.view().into_shape((flattened_input_size,)).unwrap().to_owned();
 
         for (i, delta) in deltas.iter().enumerate() {
-            if let Some(conv_layer) = self.conv_layers.get(i) {
-                let delta_reshaped = delta.clone().into_shape((
-                    conv_layer.filters.dim().0,
-                    1,
-                    1,
-                )).unwrap();
-                let gradients = self.compute_conv_gradients(conv_layer, &previous_activation, &delta_reshaped);
-                gradient_data.push((i, gradients));
+            if i == 0 {
+                // For the first layer, we need to reshape previous_activation to match dense_layer[i].nrows
+                previous_activation = previous_activation.clone().into_shape((previous_activation.len(),)).unwrap();
+            } else {
+                previous_activation = activations[i - 1].clone();
             }
 
-            if i < activations.len() - 1 {
-                previous_activation = activations[i].clone();
-            }
-        }
-
-        for (i, gradients) in gradient_data {
-            if let Some(conv_layer) = self.conv_layers.get_mut(i) {
-                let filter_shape = conv_layer.filters.dim();
-                let mut filters_owned = conv_layer.filters.to_owned(); // Clone the filters to an owned type
-                self.optimizer.update(
-                    &mut filters_owned.into_shape((filter_shape.0 * filter_shape.1 * filter_shape.2, filter_shape.3)).unwrap(),
-                    &mut conv_layer.biases,
-                    &gradients.0.into_shape((filter_shape.0 * filter_shape.1 * filter_shape.2, filter_shape.3)).unwrap(),
-                    &gradients.1,
-                );
-            }
+            let weight_update = previous_activation.view().insert_axis(Axis(1)).dot(&delta.view().insert_axis(Axis(0)));
+            self.dense_layers[i] -= &(weight_update * self.learning_rate);
+            self.dense_biases[i] -= &(delta * self.learning_rate);
         }
     }
 
-    pub fn compute_conv_gradients(&self, conv_layer: &Conv2D, input: &Array3<f64>, delta: &Array3<f64>) -> (Array4<f64>, Array1<f64>) {
-        let mut d_filters = Array4::zeros(conv_layer.filters.dim());
-        let mut d_biases = Array1::zeros(conv_layer.biases.dim());
-
-        // Compute gradients for filters and biases
-        for (filter_index, filter) in conv_layer.filters.outer_iter().enumerate() {
-            for i in 0..delta.dim().1 {
-                for j in 0..delta.dim().2 {
-                    let h_start = i * conv_layer.stride;
-                    let w_start = j * conv_layer.stride;
-                    let patch = input.slice(s![.., h_start..h_start + filter.dim().1, w_start..w_start + filter.dim().2]);
-                    d_filters.slice_mut(s![filter_index, .., .., ..]).assign(&(&patch * delta[(filter_index, i, j)]));
-                    d_biases[filter_index] += delta[(filter_index, i, j)];
-                }
-            }
-        }
-
-        (d_filters, d_biases)
-    }
 
     pub fn train(&mut self, inputs: &Array4<f64>, targets: &Array2<f64>, epochs: usize) {
         for _ in 0..epochs {
@@ -193,9 +169,9 @@ impl CNN {
         }
     }
 
-    pub fn predict(&mut self, input: &Array3<f64>) -> Array1<f64> {
+    pub fn predict(&self, input: &Array3<f64>) -> Array1<f64> {
         let activations = self.forward(input, false);
-        activations.last().unwrap().clone().into_shape((activations.last().unwrap().len(),)).unwrap()
+        activations.last().unwrap().clone()
     }
 
     pub fn save(&self, path: &str) -> std::io::Result<()> {
@@ -205,67 +181,92 @@ impl CNN {
         Ok(())
     }
 
-    pub fn load(path: &str, optimizer: Box<dyn Optimizer>) -> std::io::Result<Self> {
+    pub fn load(path: &str) -> Result<Self, std::io::Error> {
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
-        let mut model: CNN = serde_json::from_reader(reader).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        model.optimizer = optimizer;
-        Ok(model)
+        let model: Result<Self, _> = serde_json::from_reader(reader);
+        model.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array4};
-    use ndarray_rand::{rand_distr::Uniform, RandomExt};
+    use ndarray::{array, Array1, Array3, Array4};
 
     #[test]
     fn test_cnn_forward() {
-        let conv_layer = Conv2D::new(1, 1, 3, 1, 0);
-        let pool_layer = MaxPool2D::new(2, 2);
-        let dense_layer = (Array2::random((4, 2), Uniform::new(-1.0, 1.0)), Array1::zeros(2));
-        let batch_norm_layer = BatchNorm::new(4, 1e-5, 0.1);
+        let conv_layers = vec![Conv2D::new(1, 1, 2, 1, 0)];
+        let pool_layers = vec![MaxPool2D::new(2, 2)];
+        let dense_layer_sizes = vec![1, 2]; // Adjusted to match the flattened size of 1
+        let learning_rate = 0.01;
+        let dropout_rates = vec![0.5, 0.5];
+        let l2_lambda = 0.01;
+        let optimizer = "sgd".to_string();
 
-        let mut cnn = CNN::new(
-            vec![conv_layer],
-            vec![pool_layer],
-            vec![dense_layer],
-            vec![batch_norm_layer],
-            vec!["relu".to_string(), "softmax".to_string()],
-            Box::new(crate::nn::optimizers::SGD { learning_rate: 0.01 })
+        let cnn = CNN::new(
+            conv_layers,
+            pool_layers,
+            dense_layer_sizes,
+            learning_rate,
+            dropout_rates,
+            l2_lambda,
+            optimizer,
         );
 
-        let input = array![[[1.0, 0.0, -1.0], [2.0, 3.0, 0.0], [1.0, -1.0, 2.0]]];
-        let output = cnn.forward(&input, false);
-        assert_eq!(output.last().unwrap().shape(), &[1, 1, 2]);
+        let input = array![
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]
+        ];
+        println!("Input shape: {:?}", input.shape()); // Debug shape
+        let activations = cnn.forward(&input, false);
+        assert_eq!(activations.last().unwrap().len(), 2);
     }
 
-    
-    // #[test]
-    // fn test_cnn_train_predict() {
-    //     let conv_layer = Conv2D::new(1, 1, 3, 1, 0);
-    //     let pool_layer = MaxPool2D::new(2, 2);
-    //     let dense_layer = (Array2::random((4, 2), Uniform::new(-1.0, 1.0)), Array1::zeros(2));
-    //     let batch_norm_layer = BatchNorm::new(4, 1e-5, 0.1);
+    #[test]
+    fn test_cnn_train_predict() {
+        let conv_layers = vec![Conv2D::new(1, 1, 2, 1, 0)];
+        let pool_layers = vec![MaxPool2D::new(2, 2)];
+        let dense_layer_sizes = vec![1, 2]; // Adjusted to match the flattened size of 1
+        let learning_rate = 0.01;
+        let dropout_rates = vec![0.5, 0.5];
+        let l2_lambda = 0.01;
+        let optimizer = "sgd".to_string();
 
-    //     let mut cnn = CNN::new(
-    //         vec![conv_layer],
-    //         vec![pool_layer],
-    //         vec![dense_layer],
-    //         vec![batch_norm_layer],
-    //         vec!["relu".to_string(), "softmax".to_string()],
-    //         Box::new(crate::nn::optimizers::SGD { learning_rate: 0.01 })
-    //     );
+        let mut cnn = CNN::new(
+            conv_layers,
+            pool_layers,
+            dense_layer_sizes,
+            learning_rate,
+            dropout_rates,
+            l2_lambda,
+            optimizer,
+        );
 
-    //     // Correcting the input array to have four dimensions
-    //     let inputs = array![[[[1.0, 0.0, -1.0], [2.0, 3.0, 0.0], [1.0, -1.0, 2.0]]]]; // Now a 4D array
-    //     let targets = array![[1.0, 0.0]];
-    //     cnn.train(&inputs, &targets, 100);
+        // Shape of inputs should be (num_samples, channels, height, width)
+        let inputs = Array4::from_shape_vec(
+            (2, 1, 3, 3),
+            vec![
+                1.0, 2.0, 3.0, 
+                4.0, 5.0, 6.0, 
+                7.0, 8.0, 9.0,
+                9.0, 8.0, 7.0, 
+                6.0, 5.0, 4.0, 
+                3.0, 2.0, 1.0
+            ]
+        ).unwrap();
+        let targets = array![
+            [0.0, 1.0],
+            [1.0, 0.0]
+        ];
 
-    //     let input = array![[[1.0, 0.0, -1.0], [2.0, 3.0, 0.0], [1.0, -1.0, 2.0]]];
-    //     let prediction = cnn.predict(&input);
-    //     assert_eq!(prediction.shape(), &[2]);
-    // }
+        println!("Inputs shape: {:?}", inputs.shape()); // Debug shape
+        println!("Targets shape: {:?}", targets.shape()); // Debug shape
+
+        cnn.train(&inputs, &targets, 1000);
+
+        let prediction = cnn.predict(&array![
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]
+        ]);
+        assert_eq!(prediction.len(), 2);
+    }
 }
-

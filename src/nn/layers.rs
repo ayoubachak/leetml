@@ -44,6 +44,14 @@ impl Conv2D {
 
         output
     }
+
+    // Add this method
+    pub fn output_shape(&self, input_shape: (usize, usize, usize)) -> (usize, usize, usize) {
+        let (input_channels, input_height, input_width) = input_shape;
+        let output_height = (input_height + 2 * self.padding - self.filters.dim().2) / self.stride + 1;
+        let output_width = (input_width + 2 * self.padding - self.filters.dim().3) / self.stride + 1;
+        (self.filters.dim().0, output_height, output_width)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -75,6 +83,14 @@ impl MaxPool2D {
         }
 
         output
+    }
+
+    // Add this method
+    pub fn output_shape(&self, input_shape: (usize, usize, usize)) -> (usize, usize, usize) {
+        let (input_channels, input_height, input_width) = input_shape;
+        let output_height = (input_height - self.pool_size) / self.stride + 1;
+        let output_width = (input_width - self.pool_size) / self.stride + 1;
+        (input_channels, output_height, output_width)
     }
 }
 
