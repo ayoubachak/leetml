@@ -4,6 +4,8 @@ pub mod models;
 pub mod metrics;
 pub mod optim;
 pub mod nn;
+pub mod nlp;
+
 
 
 

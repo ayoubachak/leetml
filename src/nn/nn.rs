@@ -1,3 +1,4 @@
+use indicatif::ProgressBar;
 use itertools::izip;
 use ndarray::{Array1, Array2, Axis, array};
 use ndarray_rand::rand::{thread_rng, Rng};
@@ -102,14 +103,17 @@ impl SimpleNN {
     }
 
     pub fn train(&mut self, inputs: &Array2<f64>, targets: &Array2<f64>, epochs: usize) {
-        for _ in 0..epochs {
+        let progress_bar = ProgressBar::new(epochs as u64);
+        for epoch in 0..epochs {
             for (input, target) in inputs.outer_iter().zip(targets.outer_iter()) {
                 let input = input.to_owned();
                 let target = target.to_owned();
                 let (hidden_output, final_output) = self.forward(&input, true);
                 self.backward(&input, &hidden_output, &final_output, &target);
             }
+            progress_bar.inc(1);
         }
+        progress_bar.finish_with_message("Training complete");
     }
     
     pub fn predict(&self, input: &Array1<f64>) -> Array1<f64> {
@@ -299,10 +303,6 @@ impl Layer {
     }
 }
 
-// Sample optimizers module (optimizers.rs)
-
-
-// Sample learning rate scheduler module (schedulers.rs)
 
 
 #[cfg(test)]
@@ -310,6 +310,8 @@ mod tests {
     use std::fs::remove_file;
 
     use ndarray::{array, Array1, Array2};
+    use ndarray_rand::rand;
+    use ndarray_rand::rand::Rng;
 
     use crate::nn::activation::ActivationFunction;
     use crate::nn::activation::LeakyReLU;
@@ -400,6 +402,45 @@ mod tests {
 
         let prediction = nn.predict(&array![0.1, 0.2, 0.3]);
         assert_eq!(prediction.len(), 2);
+    }
+
+    #[test]
+    fn test_simple_nn_train_addition(){
+        // Create the neural network with appropriate sizes for input, hidden, and output layers
+        let input_size = 2;
+        let hidden_size = 5;
+        let output_size = 1;
+        let learning_rate = 0.01;
+        let dropout_rate = 0.0; // No dropout for simplicity
+        let l2_lambda = 0.0; // No L2 regularization for simplicity
+
+        let mut nn = SimpleNN::new(input_size, hidden_size, output_size, learning_rate, dropout_rate, l2_lambda);
+
+        // Generate training data for addition
+        let mut rng = rand::thread_rng();
+        let num_samples = 10000;
+        let range = 10.0; // Training on numbers between 0 and 10
+        let mut inputs = Array2::zeros((num_samples, input_size));
+        let mut targets = Array2::zeros((num_samples, output_size));
+
+        for i in 0..num_samples {
+            let a: f64 = rng.gen_range(0.0..range);
+            let b: f64 = rng.gen_range(0.0..range);
+            inputs[(i, 0)] = a;
+            inputs[(i, 1)] = b;
+            targets[(i, 0)] = a + b;
+        }
+
+        // Train the neural network
+        let epochs = 100;
+        nn.train(&inputs, &targets, epochs);
+
+        // // Test the trained neural network on a broader range of numbers
+        let test_inputs = array![[5.5, 4.5], [7.1, 2.2], [9.9, 0.8], [3.3, 7.7], [10.0, 5.0], [8.5, 1.5]];
+        for input in test_inputs.outer_iter() {
+            let prediction = nn.predict(&input.to_owned());
+            println!("Input: {:?}, Prediction: {:?}", input, prediction);
+        }
     }
 
     #[test]

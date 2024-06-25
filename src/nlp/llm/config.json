@@ -1,0 +1,16 @@
+{
+    "api_url": "https://api-inference.huggingface.co/models",
+    "headers": {
+        "Authorization": "Bearer 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",
+        "Content-Type": "application/json"
+    },
+    "model_huggingface_id": "mistralai/Mistral-7B-Instruct-v0.2",
+    "default_parameters": {
+        "max_length": -1,
+        "max_tokens": 1000,
+        "max_new_tokens": 250,
+        "temperature": 1e-8,
+        "use_cache": true,
+        "wait_for_model": true
+    }
+}
